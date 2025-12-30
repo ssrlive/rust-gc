@@ -8,6 +8,11 @@ use std::ptr::{self, NonNull};
 #[cfg(feature = "nightly")]
 use std::marker::Unsize;
 
+pub enum GcBoxType {
+    Standard,
+    Ephemeron,
+}
+
 struct GcState {
     stats: GcStats,
     config: GcConfig,
@@ -70,6 +75,14 @@ impl GcBoxHeader {
     }
 
     #[inline]
+    pub fn new_ephemeron(next: Option<NonNull<GcBox<dyn Trace>>>) -> Self {
+        GcBoxHeader {
+            roots: Cell::new(0),
+            next: Cell::new(next),
+        }
+    }
+
+    #[inline]
     pub fn roots(&self) -> usize {
         self.roots.get() & ROOTS_MASK
     }
@@ -106,11 +119,31 @@ impl GcBoxHeader {
     pub fn unmark(&self) {
         self.roots.set(self.roots.get() & !MARK_MASK);
     }
+
+    #[inline]
+    pub fn is_alive(&self) -> bool {
+        // A box is considered alive if it is currently present in the
+        // thread-local GC chain. We scan the chain for the header's
+        // address. This is cheaper and more robust than relying on
+        // mark-bits which are transient during collection.
+        use std::ptr;
+        GC_STATE.with(|st| {
+            let st = st.borrow();
+            let mut cur = st.boxes_start;
+            while let Some(node) = cur {
+                let header_ptr = unsafe { &node.as_ref().header as *const GcBoxHeader };
+                if ptr::eq(self as *const GcBoxHeader, header_ptr) {
+                    return true;
+                }
+                cur = unsafe { node.as_ref().header.next.get() };
+            }
+            false
+        })
+    }
 }
 
-#[repr(C)] // to justify the layout computations in GcBox::from_box, Gc::from_raw
-pub(crate) struct GcBox<T: ?Sized + 'static> {
-    header: GcBoxHeader,
+pub struct GcBox<T: Trace + ?Sized + 'static> {
+    pub(crate) header: GcBoxHeader,
     data: T,
 }
 
@@ -120,9 +153,13 @@ impl<T: Trace> GcBox<T> {
     /// trigger a collection.
     ///
     /// A `GcBox` allocated this way starts its life rooted.
-    pub(crate) fn new(value: T) -> NonNull<Self> {
+    pub(crate) fn new(value: T, box_type: GcBoxType) -> NonNull<Self> {
+        let header = match box_type {
+            GcBoxType::Standard => GcBoxHeader::new(),
+            GcBoxType::Ephemeron => GcBoxHeader::new_ephemeron(None),
+        };
         let gcbox = NonNull::from(Box::leak(Box::new(GcBox {
-            header: GcBoxHeader::new(),
+            header,
             data: value,
         })));
         unsafe { insert_gcbox(gcbox) };
@@ -217,7 +254,7 @@ unsafe fn insert_gcbox(gcbox: NonNull<GcBox<dyn Trace>>) {
     });
 }
 
-impl<T: ?Sized> GcBox<T> {
+impl<T: Trace + ?Sized> GcBox<T> {
     /// Returns `true` if the two references refer to the same `GcBox`.
     pub(crate) fn ptr_eq(this: &GcBox<T>, other: &GcBox<T>) -> bool {
         // Use .header to ignore fat pointer vtables, to work around
@@ -234,9 +271,18 @@ impl<T: Trace + ?Sized> GcBox<T> {
             unsafe { self.data.trace() };
         }
     }
+
+    /// Trace inner data for weak/ephemeron relationships.
+    #[allow(clippy::type_complexity)]
+    pub(crate) unsafe fn weak_trace_inner(
+        &self,
+        queue: &mut Vec<(NonNull<GcBox<dyn Trace>>, NonNull<GcBox<dyn Trace>>)>,
+    ) {
+        unsafe { self.data.weak_trace(queue) };
+    }
 }
 
-impl<T: ?Sized> GcBox<T> {
+impl<T: Trace + ?Sized> GcBox<T> {
     /// Increases the root count on this `GcBox`.
     /// Roots prevent the `GcBox` from being destroyed by the garbage collector.
     pub(crate) unsafe fn root_inner(&self) {
@@ -266,34 +312,6 @@ fn collect_garbage(st: &mut GcState) {
         incoming: &'a Cell<Option<NonNull<GcBox<dyn Trace>>>>,
         this: NonNull<GcBox<dyn Trace>>,
     }
-    unsafe fn mark(head: &Cell<Option<NonNull<GcBox<dyn Trace>>>>) -> Vec<Unmarked<'_>> {
-        // Walk the tree, tracing and marking the nodes
-        let mut mark_head = head.get();
-        while let Some(node) = mark_head {
-            if unsafe { node.as_ref().header.roots() } > 0 {
-                unsafe { node.as_ref().trace_inner() };
-            }
-
-            mark_head = unsafe { node.as_ref().header.next.get() };
-        }
-
-        // Collect a vector of all of the nodes which were not marked,
-        // and unmark the ones which were.
-        let mut unmarked = Vec::new();
-        let mut unmark_head = head;
-        while let Some(node) = unmark_head.get() {
-            if unsafe { node.as_ref().header.is_marked() } {
-                unsafe { node.as_ref().header.unmark() };
-            } else {
-                unmarked.push(Unmarked {
-                    incoming: unmark_head,
-                    this: node,
-                });
-            }
-            unmark_head = unsafe { &node.as_ref().header.next };
-        }
-        unmarked
-    }
 
     unsafe fn sweep(finalized: Vec<Unmarked<'_>>, bytes_allocated: &mut usize) {
         let _guard = DropGuard::new();
@@ -310,16 +328,80 @@ fn collect_garbage(st: &mut GcState) {
 
     st.stats.collections_performed += 1;
 
+    let head = Cell::from_mut(&mut st.boxes_start);
+
+    #[allow(clippy::type_complexity)]
+    type EPair = (NonNull<GcBox<dyn Trace>>, NonNull<GcBox<dyn Trace>>);
+
+    unsafe fn initial_mark_and_collect_ephemerons(
+        head: &Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+        ephemeron_queue: &mut Vec<EPair>,
+    ) {
+        let mut mark_head = head.get();
+        while let Some(node) = mark_head {
+            if unsafe { node.as_ref().header.roots() } > 0 {
+                unsafe { node.as_ref().trace_inner() };
+                unsafe { node.as_ref().weak_trace_inner(ephemeron_queue) };
+            }
+            mark_head = unsafe { node.as_ref().header.next.get() };
+        }
+    }
+
+    unsafe fn process_ephemeron_queue(ephemeron_queue: &mut Vec<EPair>) {
+        let mut idx = 0usize;
+        while idx < ephemeron_queue.len() {
+            let (key_ptr, value_ptr) = ephemeron_queue[idx];
+            idx += 1;
+            let key_marked = unsafe { key_ptr.as_ref().header.is_marked() }
+                || unsafe { key_ptr.as_ref().value().is_marked_ephemeron() };
+            if key_marked && !unsafe { value_ptr.as_ref().header.is_marked() } {
+                unsafe { value_ptr.as_ref().trace_inner() };
+                unsafe { value_ptr.as_ref().weak_trace_inner(ephemeron_queue) };
+            }
+        }
+    }
+
+    unsafe fn collect_unmarked_nodes<'a>(
+        head: &'a Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    ) -> Vec<Unmarked<'a>> {
+        let mut unmarked = Vec::new();
+        let mut unmark_head = head;
+        while let Some(node) = unmark_head.get() {
+            if unsafe { node.as_ref().header.is_marked() } {
+                unsafe { node.as_ref().header.unmark() };
+            } else {
+                unmarked.push(Unmarked {
+                    incoming: unmark_head,
+                    this: node,
+                });
+            }
+            unmark_head = unsafe { &node.as_ref().header.next };
+        }
+        unmarked
+    }
+
     unsafe {
-        let head = Cell::from_mut(&mut st.boxes_start);
-        let unmarked = mark(head);
+        // #[allow(clippy::type_complexity)]
+        let mut ephemeron_queue: Vec<EPair> = Vec::new();
+
+        initial_mark_and_collect_ephemerons(head, &mut ephemeron_queue);
+        process_ephemeron_queue(&mut ephemeron_queue);
+
+        let unmarked = collect_unmarked_nodes(head);
+
         if unmarked.is_empty() {
             return;
         }
+
         for node in &unmarked {
             Trace::finalize_glue(&node.this.as_ref().data);
         }
-        mark(head);
+
+        // #[allow(clippy::type_complexity)]
+        let mut ephemeron_queue2: Vec<EPair> = Vec::new();
+        initial_mark_and_collect_ephemerons(head, &mut ephemeron_queue2);
+        process_ephemeron_queue(&mut ephemeron_queue2);
+
         sweep(unmarked, &mut st.stats.bytes_allocated);
     }
 }
@@ -356,7 +438,7 @@ impl Default for GcConfig {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "unstable-config")]
 pub fn configure(configurer: impl FnOnce(&mut GcConfig)) {
     GC_STATE.with(|st| {
         let mut st = st.borrow_mut();
