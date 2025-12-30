@@ -1,7 +1,10 @@
 [package]
 name = "gc_derive"
 version = "0.5.0"
-authors = ["Manish Goregaokar <manishsmail@gmail.com>", "Nika Layzell <nika@thelayzells.com>"]
+authors = [
+    "Manish Goregaokar <manishsmail@gmail.com>",
+    "Nika Layzell <nika@thelayzells.com>",
+]
 
 description = "Garbage collector derive plugin for rust-gc"
 repository = "https://github.com/Manishearth/rust-gc"
